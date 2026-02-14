@@ -2891,18 +2891,15 @@ end
 ------------------------------------------------------------
 -- EnableFreecam : toggle ON/OFF
 ------------------------------------------------------------
-------------------------------------------------------------
--- EnableFreecam : toggle ON/OFF
-------------------------------------------------------------
 function EnableFreecam()
     -- Init state une seule fois
     if not _G.vortexFreecam then
         _G.vortexFreecam = {
             isToggled = false,
-            cam = nil,
+            cam = nil,              -- handle camera scriptee
             pos = vector3(0, 0, 0),
-            pitch = 0.0,
-            heading = 0.0,
+            pitch = 0.0,            -- rotation haut/bas (degres)
+            heading = 0.0,          -- rotation gauche/droite (degres)
             cameraSpeed = 2.0,
             currentSpeed = 0.0,
             lastMoveDir = vector3(0, 0, 0),
@@ -2956,8 +2953,7 @@ function EnableFreecam()
             prevKeys = {},
             threadsStarted = false,
             shutdown = false,
-            tpBusy = false,
-            needsCamInit = false
+            tpBusy = false
         }
     end
 
@@ -2972,55 +2968,60 @@ function EnableFreecam()
         local ped = PlayerPedId()
         local coords = GetEntityCoords(ped)
 
-        local grX, grY, grZ = GetGameplayCamRot(2)
-        if type(grX) == "vector3" then
-            fc.pitch = grX.x
-            fc.heading = grX.z
-        else
-            fc.pitch = grX or 0.0
-            fc.heading = grZ or 0.0
-        end
-
+        -- Recuperer l'orientation actuelle du gameplay camera
+        local gameRot = GetGameplayCamRot(2)
+        fc.pitch = gameRot.x
+        fc.heading = gameRot.z
         fc.pos = vector3(coords.x, coords.y, coords.z + 1.0)
         fc.currentSpeed = 0.0
         fc.lastMoveDir = vector3(0, 0, 0)
         fc.currentFeature = fc.savedFeature or 1
         fc.tpBusy = false
-        fc.needsCamInit = true -- Demander creation au thread
 
-        -- Debloquer la camera si elle etait verrouillee d'une session precedente
-        if type(Susano) == "table" and type(Susano.LockCameraPos) == "function" then
-            pcall(Susano.LockCameraPos, false)
-        end
-
-        -- Nettoyage preventif
+        -- Creer la camera scriptee (completement detachee du ped)
         if fc.cam and DoesCamExist(fc.cam) then
             DestroyCam(fc.cam, false)
-            fc.cam = nil
         end
+        fc.cam = CreateCam("DEFAULT_SCRIPTED_CAMERA", true)
+        SetCamCoord(fc.cam, fc.pos.x, fc.pos.y, fc.pos.z)
+        SetCamRot(fc.cam, fc.pitch, 0.0, fc.heading, 2)
+        SetCamFov(fc.cam, GetGameplayCamFov())
+        SetCamActive(fc.cam, true)
+        RenderScriptCams(true, false, 0, true, true)
 
-        -- Masquer ped
+        -- Verrouiller le ped (invisible, freeze, no collision)
         FreezeEntityPosition(ped, true)
         SetEntityVisible(ped, false, false)
         SetEntityInvincible(ped, true)
         SetEntityCollision(ped, false, false)
         SetEntityAlpha(ped, 0, false)
 
+        -- Threads (une seule fois)
         if not fc.threadsStarted then
             fc.threadsStarted = true
 
-            -- Thread unique pour tout gerer (plus stable)
+            -- Thread UI
             Citizen.CreateThread(function()
                 while _G.vortexFreecam and not _G.vortexFreecam.shutdown do
                     if _G.vortexFreecam.isToggled then
-                        vortex_fcTick()
                         vortex_fcDrawUI()
                     end
                     Citizen.Wait(0)
                 end
             end)
+
+            -- Thread principal (mouvement + features)
+            Citizen.CreateThread(function()
+                while _G.vortexFreecam and not _G.vortexFreecam.shutdown do
+                    if _G.vortexFreecam.isToggled then
+                        vortex_fcTick()
+                    end
+                    Citizen.Wait(0)
+                end
+            end)
         end
-        print("^2[FREECAM] ON (Wait for cam creation logic...)^0")
+
+        print("^2[FREECAM] ON^0")
 
     else
         -----------------------------------------------
@@ -3028,8 +3029,8 @@ function EnableFreecam()
         -----------------------------------------------
         fc.savedFeature = fc.currentFeature
         fc.currentSpeed = 0.0
-        fc.needsCamInit = false
 
+        -- Detruire la camera scriptee, retour camera gameplay
         if fc.cam and DoesCamExist(fc.cam) then
             RenderScriptCams(false, false, 0, true, true)
             SetCamActive(fc.cam, false)
@@ -3037,21 +3038,20 @@ function EnableFreecam()
             fc.cam = nil
         end
 
+        -- Restaurer le ped
         local ped = PlayerPedId()
         ResetEntityAlpha(ped)
         SetEntityVisible(ped, true, false)
         SetEntityCollision(ped, true, true)
         SetEntityInvincible(ped, false)
         FreezeEntityPosition(ped, false)
+
+        -- TP le ped a la position de la camera
         SetEntityCoords(ped, fc.pos.x, fc.pos.y, fc.pos.z - 1.0, false, false, false, false)
         SetFocusEntity(ped)
         ClearFocus()
 
-        -- Debloquer la camera si on l'avait verrouillee
-        if type(Susano) == "table" and type(Susano.LockCameraPos) == "function" then
-            pcall(Susano.LockCameraPos, false)
-        end
-
+        -- Cleanup RC car
         if _G.rcCarControlActive then
             if _G.rcCameraControl then
                 RenderScriptCams(false, true, 500, true, true)
@@ -3070,51 +3070,11 @@ end
 -- Helpers input
 ------------------------------------------------------------
 
-local vortex_fcControlMap = {
-    [0x5A] = 32, -- Z -> Move Forward (AZERTY)
-    [0x57] = 32, -- W -> Move Forward (QWERTY)
-    [0x53] = 33, -- S -> Move Back
-    [0x51] = 34, -- Q -> Move Left
-    [0x41] = 34, -- A -> Move Left (QWERTY)
-    [0x44] = 35, -- D -> Move Right
-    [0x20] = 22, -- Space -> Jump (ascend)
-    [0x11] = 36, -- Ctrl -> Duck (descend)
-    [0x10] = 21, -- Shift -> Sprint (speed boost)
-    [0x01] = 24, -- LMB
-}
-
-local vortex_fcKeyAliases = {
-    forward = {0x5A, 0x57},
-    backward = {0x53},
-    left = {0x51, 0x41},
-    right = {0x44},
-    ascend = {0x20},
-    descend = {0x11},
-    boost = {0x10}
-}
-
-local function vortex_fcControlDown(control)
-    return IsDisabledControlPressed(0, control) or IsControlPressed(0, control)
-end
-
 -- Touche maintenue (Susano)
 function vortex_fcKeyDown(vk)
     if type(Susano) == "table" and type(Susano.GetAsyncKeyState) == "function" then
-        local ok, result = pcall(Susano.GetAsyncKeyState, vk)
-        if ok then
-            -- GetAsyncKeyState peut retourner un bool ou un nombre
-            -- En Lua, 0 est truthy, donc on doit verifier explicitement
-            if type(result) == "boolean" then
-                if result then return true end
-            elseif type(result) == "number" then
-                if result ~= 0 then return true end
-            end
-        end
-    end
-
-    local mappedControl = vortex_fcControlMap[vk]
-    if mappedControl then
-        return vortex_fcControlDown(mappedControl)
+        local down = Susano.GetAsyncKeyState(vk)
+        return down
     end
     return false
 end
@@ -3124,20 +3084,17 @@ function vortex_fcKeyJustPressed(vk)
     local fc = _G.vortexFreecam
     if not fc then return false end
     local down = vortex_fcKeyDown(vk)
-    local wasDown = fc.prevKeys[vk] or false
+    local was = fc.prevKeys[vk] or false
     fc.prevKeys[vk] = down
-    return down and not wasDown
+    return down and not was
 end
 
-local function vortex_fcAliasDown(alias)
-    local keys = vortex_fcKeyAliases[alias]
-    if not keys then return false end
-    for i = 1, #keys do
-        if vortex_fcKeyDown(keys[i]) then
-            return true
-        end
+-- Siege vide dans vehicule
+function vortex_fcGetEmptySeat(vehicle)
+    for _, seat in ipairs({ -1, 0, 1, 2 }) do
+        if IsVehicleSeatFree(vehicle, seat) then return seat end
     end
-    return false
+    return -1
 end
 
 ------------------------------------------------------------
@@ -3145,7 +3102,7 @@ end
 ------------------------------------------------------------
 function vortex_fcDrawUI()
     local fc = _G.vortexFreecam
-    if not fc or not fc.isToggled then return end
+    if not fc then return end
 
     -- Crosshair "+"
     SetTextFont(0)
@@ -3234,72 +3191,100 @@ end
 function vortex_fcTick()
     local fc = _G.vortexFreecam
     if not fc or not fc.isToggled then return end
-
-    -- Lazy init cam if needed
-    if fc.needsCamInit or not fc.cam or not DoesCamExist(fc.cam) then
-        if fc.cam and DoesCamExist(fc.cam) then DestroyCam(fc.cam, false) end
-        fc.cam = CreateCam("DEFAULT_SCRIPTED_CAMERA", true)
-        if not fc.cam or fc.cam == 0 then return end
-        SetCamCoord(fc.cam, fc.pos.x, fc.pos.y, fc.pos.z)
-        SetCamRot(fc.cam, fc.pitch, 0.0, fc.heading, 2)
-        SetCamFov(fc.cam, GetGameplayCamFov())
-        SetCamActive(fc.cam, true)
-        RenderScriptCams(true, false, 0, true, true)
-        fc.needsCamInit = false
-    end
+    if not fc.cam or not DoesCamExist(fc.cam) then return end
 
     local dt = GetFrameTime()
     if dt <= 0 or dt > 0.1 then dt = 0.016 end
 
-    -- Disable standard inputs
+    -----------------------------------------------
+    -- DESACTIVER TOUS LES CONTROLES, puis reactiver
+    -- ce dont on a besoin (souris, scroll, HUD)
+    -----------------------------------------------
     DisableAllControlActions(0)
-    EnableControlAction(0, 241, true)
-    EnableControlAction(0, 242, true)
-    EnableControlAction(0, 245, true)
-    EnableControlAction(0, 200, true)
-    EnableControlAction(0, 322, true)
 
-    -- Mouse rotation (always available via GetDisabledControlNormal)
-    local mouseX = GetDisabledControlNormal(0, 1)
-    local mouseY = GetDisabledControlNormal(0, 2)
+    -- Souris look (on lit les valeurs AVANT de les desactiver)
+    -- Controls 1/2 = mouse X/Y (on les laisse disabled mais on lit avec GetDisabledControlNormal)
+    -- Scroll wheel pour features
+    EnableControlAction(0, 241, true)  -- Scroll up
+    EnableControlAction(0, 242, true)  -- Scroll down
+    -- HUD
+    EnableControlAction(0, 245, true)  -- Chat
+    EnableControlAction(0, 200, true)  -- Pause menu
+    EnableControlAction(0, 322, true)  -- Escape
+
+    -----------------------------------------------
+    -- ROTATION CAMERA (souris)
+    -- GetDisabledControlNormal lit l'input meme si le controle est disabled
+    -- Control 1 = Mouse X (gauche/droite), Control 2 = Mouse Y (haut/bas)
+    -----------------------------------------------
+    local mouseX = GetDisabledControlNormal(0, 1)  -- -1.0 a 1.0 (gauche/droite)
+    local mouseY = GetDisabledControlNormal(0, 2)  -- -1.0 a 1.0 (haut/bas)
     local sens = fc.mouseSensitivity
 
     fc.heading = fc.heading - mouseX * sens
     fc.pitch = fc.pitch - mouseY * sens
 
+    -- Clamp pitch entre -89 et 89 degres
     if fc.pitch > 89.0 then fc.pitch = 89.0 end
     if fc.pitch < -89.0 then fc.pitch = -89.0 end
+
+    -- Normaliser heading entre -180 et 180
     if fc.heading > 180.0 then fc.heading = fc.heading - 360.0 end
     if fc.heading < -180.0 then fc.heading = fc.heading + 360.0 end
 
-    -- Direction vectors
+    -----------------------------------------------
+    -- VECTEURS DE DIRECTION
+    -- Calcules a partir de NOS angles (pas les angles gameplay)
+    -----------------------------------------------
     local pitchRad = math.rad(fc.pitch)
     local headRad = math.rad(fc.heading)
+
     local cp = math.cos(pitchRad)
     local sp = math.sin(pitchRad)
     local ch = math.cos(headRad)
     local sh = math.sin(headRad)
 
+    -- Forward : direction ou la camera regarde (suit pitch + heading)
     local fwdX = -sh * cp
     local fwdY =  ch * cp
     local fwdZ =  sp
+
+    -- Right : perpendiculaire sur le plan horizontal
     local rightX =  ch
     local rightY =  sh
 
-    -- ZQSD Movement
+    -----------------------------------------------
+    -- INPUT MOUVEMENT : AZERTY (ZQSD)
+    -----------------------------------------------
     local ix, iy, iz = 0.0, 0.0, 0.0
-    if vortex_fcAliasDown("forward") then ix = ix + fwdX; iy = iy + fwdY; iz = iz + fwdZ end
-    if vortex_fcAliasDown("backward") then ix = ix - fwdX; iy = iy - fwdY; iz = iz - fwdZ end
-    if vortex_fcAliasDown("right") then ix = ix + rightX; iy = iy + rightY end
-    if vortex_fcAliasDown("left") then ix = ix - rightX; iy = iy - rightY end
-    if vortex_fcAliasDown("ascend") then iz = iz + 1.0 end
-    if vortex_fcAliasDown("descend") then iz = iz - 1.0 end
 
-    -- Acceleration
+    if vortex_fcKeyDown(0x5A) then  -- Z = avancer
+        ix = ix + fwdX; iy = iy + fwdY; iz = iz + fwdZ
+    end
+    if vortex_fcKeyDown(0x53) then  -- S = reculer
+        ix = ix - fwdX; iy = iy - fwdY; iz = iz - fwdZ
+    end
+    if vortex_fcKeyDown(0x44) then  -- D = droite
+        ix = ix + rightX; iy = iy + rightY
+    end
+    if vortex_fcKeyDown(0x51) then  -- Q = gauche
+        ix = ix - rightX; iy = iy - rightY
+    end
+    if vortex_fcKeyDown(0x20) then  -- Espace = monter
+        iz = iz + 1.0
+    end
+    if vortex_fcKeyDown(0x11) then  -- Ctrl = descendre
+        iz = iz - 1.0
+    end
+
+    -----------------------------------------------
+    -- ACCELERATION FLUIDE
+    -----------------------------------------------
     local inputLen = math.sqrt(ix * ix + iy * iy + iz * iz)
     local hasInput = inputLen > 0.001
+
     local maxSpeed = fc.cameraSpeed * 30.0
-    if vortex_fcAliasDown("boost") then maxSpeed = maxSpeed * 3.0 end
+    if vortex_fcKeyDown(0x10) then maxSpeed = maxSpeed * 3.0 end  -- Shift = x3
 
     if hasInput then
         fc.lastMoveDir = vector3(ix / inputLen, iy / inputLen, iz / inputLen)
@@ -3310,30 +3295,33 @@ function vortex_fcTick()
         if fc.currentSpeed < 0.05 then fc.currentSpeed = 0.0 end
     end
 
+    -- Appliquer mouvement
     if fc.currentSpeed > 0.01 then
         local delta = fc.currentSpeed * dt
         local d = fc.lastMoveDir
         fc.pos = vector3(fc.pos.x + d.x * delta, fc.pos.y + d.y * delta, fc.pos.z + d.z * delta)
     end
 
-    -- Update camera
+    -----------------------------------------------
+    -- APPLIQUER POSITION + ROTATION A LA CAMERA SCRIPTEE
+    -----------------------------------------------
     SetCamCoord(fc.cam, fc.pos.x, fc.pos.y, fc.pos.z)
     SetCamRot(fc.cam, fc.pitch, 0.0, fc.heading, 2)
-    SetCamActive(fc.cam, true)
-    RenderScriptCams(true, false, 0, true, true)
+
+    -- Streamer le monde autour de la camera
     SetFocusPosAndVel(fc.pos.x, fc.pos.y, fc.pos.z, 0.0, 0.0, 0.0)
 
-    -- Lock ped
+    -- Verrouiller le ped chaque frame
     local ped = PlayerPedId()
-    if not IsEntityVisible(ped) then -- Only if we hid it
-        FreezeEntityPosition(ped, true)
-        SetEntityVisible(ped, false, false)
-        SetEntityInvincible(ped, true)
-    end
+    FreezeEntityPosition(ped, true)
+    SetEntityVisible(ped, false, false)
+    SetEntityInvincible(ped, true)
 
-    -- Features scrolling
-    local scrollUp = IsDisabledControlJustPressed(0, 241) or IsDisabledControlJustPressed(0, 172) or vortex_fcKeyJustPressed(0x26)
-    local scrollDown = IsDisabledControlJustPressed(0, 242) or IsDisabledControlJustPressed(0, 173) or vortex_fcKeyJustPressed(0x28)
+    -----------------------------------------------
+    -- SCROLL FEATURES (molette + fleches haut/bas)
+    -----------------------------------------------
+    local scrollUp = IsControlJustPressed(0, 241) or IsControlJustPressed(0, 172) or vortex_fcKeyJustPressed(0x26)
+    local scrollDown = IsControlJustPressed(0, 242) or IsControlJustPressed(0, 173) or vortex_fcKeyJustPressed(0x28)
 
     if scrollUp then
         local prev = fc.currentFeature
@@ -3350,7 +3338,7 @@ function vortex_fcTick()
         fc.smoothScrollOffset = fc.smoothScrollOffset + (prev - fc.currentFeature) * 0.025
     end
 
-    -- Features selection
+    -- Selection modele (fleches gauche/droite)
     local feat = fc.features[fc.currentFeature]
     local leftP = vortex_fcKeyJustPressed(0x25)
     local rightP = vortex_fcKeyJustPressed(0x27)
@@ -3366,35 +3354,36 @@ function vortex_fcTick()
         if rightP then fc.currentExplosionIndex = fc.currentExplosionIndex + 1; if fc.currentExplosionIndex > #fc.explosionTypes then fc.currentExplosionIndex = 1 end end
     end
 
-    -- RC Car override
+    -- Mode RC Car
     if _G.rcCarControlActive and _G.rcCarControl and DoesEntityExist(_G.rcCarControl) then
         vortex_fcHandleRCCar()
         return
     end
 
-    -- Raycast
+    -----------------------------------------------
+    -- RAYCAST depuis la camera (direction = forward)
+    -----------------------------------------------
     local rEx = fc.pos.x + fwdX * 500.0
     local rEy = fc.pos.y + fwdY * 500.0
     local rEz = fc.pos.z + fwdZ * 500.0
-    
-    -- Using the expensive probe only if not busy to save perf? No, needed for aim.
-    -- Include own ped to ignore it
     local rayHandle = StartExpensiveSynchronousShapeTestLosProbe(
         fc.pos.x, fc.pos.y, fc.pos.z,
-        rEx, rEy, rEz, -1, ped, 7
+        rEx, rEy, rEz, -1
     )
-    local retval, hit, endCoords, _, entityHit = GetShapeTestResult(rayHandle)
-    if retval ~= 2 then hit = false end
+    local _, hit, endCoords, _, entityHit = GetShapeTestResult(rayHandle)
 
-    -- Trigger Feature
     local lmbPressed = vortex_fcKeyJustPressed(0x01)
     local lmbDown = vortex_fcKeyDown(0x01)
 
+    -----------------------------------------------
+    -- EXECUTION DES FEATURES
+    -----------------------------------------------
     if feat == "TP Camera" then
         if lmbPressed and hit then
             fc.pos = vector3(endCoords.x, endCoords.y, endCoords.z + 1.0)
             SetCamCoord(fc.cam, fc.pos.x, fc.pos.y, fc.pos.z)
         end
+
     elseif feat == "Teleport" then
         if lmbPressed and hit and not fc.tpBusy then
             fc.tpBusy = true
@@ -3406,21 +3395,28 @@ function vortex_fcTick()
                 SetEntityCollision(tped, true, true)
                 SetEntityVisible(tped, true, false)
                 ResetEntityAlpha(tped)
+
                 if tpEntity ~= 0 and IsEntityAVehicle(tpEntity) then
                     local seat = vortex_fcGetEmptySeat(tpEntity)
                     TaskWarpPedIntoVehicle(tped, tpEntity, seat)
                 else
                     SetEntityCoords(tped, tpCoords.x, tpCoords.y, tpCoords.z + 0.5, false, false, false, false)
                 end
+
                 Citizen.Wait(250)
+
                 FreezeEntityPosition(tped, true)
                 SetEntityCollision(tped, false, false)
                 SetEntityVisible(tped, false, false)
                 SetEntityInvincible(tped, true)
                 SetEntityAlpha(tped, 0, false)
-                if _G.vortexFreecam then _G.vortexFreecam.tpBusy = false end
+
+                if _G.vortexFreecam then
+                    _G.vortexFreecam.tpBusy = false
+                end
             end)
         end
+
     elseif feat == "Shoot" then
         if lmbPressed then
             local sped = PlayerPedId()
@@ -3429,15 +3425,27 @@ function vortex_fcTick()
             GiveWeaponToPed(sped, wh, 255, false, true)
             SetCurrentPedWeapon(sped, wh, true)
             local dmg = (wm == "weapon_stungun") and 0 or 100
-            ShootSingleBulletBetweenCoords(fc.pos.x, fc.pos.y, fc.pos.z, rEx, rEy, rEz, dmg, true, wh, sped, true, false, 1000.0)
+            ShootSingleBulletBetweenCoords(
+                fc.pos.x, fc.pos.y, fc.pos.z,
+                rEx, rEy, rEz,
+                dmg, true, wh, sped, true, false, 1000.0
+            )
         end
+
     elseif feat == "Shoot Car" then
-        if lmbPressed then vortex_fcShootCar(vector3(fwdX, fwdY, fwdZ)) end
+        if lmbPressed then
+            vortex_fcShootCar(vector3(fwdX, fwdY, fwdZ))
+        end
+
     elseif feat == "Spawn Bomb" then
-        if lmbPressed and hit then vortex_fcSpawnBomb(endCoords) end
+        if lmbPressed and hit then
+            vortex_fcSpawnBomb(endCoords)
+        end
+
     elseif feat == "Blackhole" then
         fc.blackholeFrameCount = fc.blackholeFrameCount + 1
         local shouldUpdate = (fc.blackholeFrameCount % 3 == 0)
+
         if lmbDown and shouldUpdate then
             local pool = GetGamePool("CVehicle")
             if pool then
@@ -3465,6 +3473,7 @@ function vortex_fcTick()
                 end
             end
         end
+
         if fc.blackholePressed and not lmbDown then
             local pool = GetGamePool("CVehicle")
             if pool then
@@ -3484,6 +3493,7 @@ function vortex_fcTick()
             fc.blackholeControlledVehicles = {}
         end
         fc.blackholePressed = lmbDown
+
     elseif feat == "Kick Vehicle" then
         if lmbPressed and hit and entityHit ~= 0 and IsEntityAVehicle(entityHit) then
             local driver = GetPedInVehicleSeat(entityHit, -1)
@@ -3493,6 +3503,7 @@ function vortex_fcTick()
                 SetPedToRagdoll(driver, 1000, 1000, 0, 0, 0, 0)
             end
         end
+
     elseif feat == "Delete Vehicle" then
         if lmbPressed and hit and entityHit ~= 0 and IsEntityAVehicle(entityHit) then
             local targetVeh = entityHit
@@ -3506,6 +3517,7 @@ function vortex_fcTick()
                 end
             end)
         end
+
     elseif feat == "Fuck Vehicle" then
         if lmbPressed and hit and entityHit ~= 0 and IsEntityAVehicle(entityHit) then
             local targetVeh = entityHit
@@ -3521,6 +3533,7 @@ function vortex_fcTick()
                 end
             end)
         end
+
     elseif feat == "RC Control Car" then
         if lmbPressed and hit and entityHit ~= 0 and IsEntityAVehicle(entityHit) then
             local targetVeh = entityHit
@@ -3540,6 +3553,7 @@ function vortex_fcTick()
                 SetEntityCanBeDamaged(targetVeh, false)
                 SetVehicleCanBeVisiblyDamaged(targetVeh, false)
                 SetVehicleOnGroundProperly(targetVeh)
+                -- Detacher la freecam camera, attacher au vehicule
                 local fc2 = _G.vortexFreecam
                 if fc2 and fc2.cam and DoesCamExist(fc2.cam) then
                     SetCamActive(fc2.cam, false)
