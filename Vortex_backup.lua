@@ -3555,7 +3555,7 @@ function vortex_fcTick()
                 SetVehicleOnGroundProperly(targetVeh)
                 -- Detacher la freecam camera, attacher au vehicule
                 local fc2 = _G.vortexFreecam
-                if fc2.cam and DoesCamExist(fc2.cam) then
+                if fc2 and fc2.cam and DoesCamExist(fc2.cam) then
                     SetCamActive(fc2.cam, false)
                 end
                 _G.rcCameraControl = CreateCam("DEFAULT_SCRIPTED_CAMERA", true)
